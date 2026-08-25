@@ -1,0 +1,24 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+*.tsbuildinfo
+
+# Local/editor backups
+*backup*
+*.bak
+*.old
+*.orig
+*~
+*.pre-*
+*.before-*
+.auth-*-backup-*/
+.auth-foundation-backup-*/
+.phase-*-backup-*/
+backups/
+
+# Supabase CLI local state
+supabase/.temp/
