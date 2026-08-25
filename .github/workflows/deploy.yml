@@ -1,0 +1,171 @@
+name: Deploy IVM Optim to JAN3
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ivm-optim-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to JAN3
+
+    runs-on:
+      - self-hosted
+      - Linux
+      - ARM64
+      - jan3-server
+
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout IVM Optim
+        uses: actions/checkout@v4
+
+      - name: Verify JAN3 environment
+        run: |
+          echo "======================================"
+          echo " IVM OPTIM — JAN3 DEPLOYMENT"
+          echo "======================================"
+          echo
+          echo "Commit:"
+          git log -1 --oneline
+          echo
+          echo "Host:"
+          hostname
+          echo
+          echo "Architecture:"
+          uname -m
+          echo
+          echo "Node:"
+          node --version
+          echo
+          echo "NPM:"
+          npm --version
+
+      - name: Preserve production environment
+        run: |
+          set -e
+
+          if [ -f /home/pi/IVM-Optim/.env.local ]; then
+            echo "Using IVM Optim production environment."
+            cp /home/pi/IVM-Optim/.env.local /tmp/ivm-optim.env.local
+
+          elif [ -f /home/pi/ivm-program-decision-platform/.env.local ]; then
+            echo "Using legacy IVM production environment."
+            cp /home/pi/ivm-program-decision-platform/.env.local /tmp/ivm-optim.env.local
+
+          else
+            echo "ERROR: No production .env.local found."
+            echo
+            echo "Checked:"
+            echo "/home/pi/IVM-Optim/.env.local"
+            echo "/home/pi/ivm-program-decision-platform/.env.local"
+            exit 1
+          fi
+
+          chmod 600 /tmp/ivm-optim.env.local
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Restore production environment
+        run: |
+          cp /tmp/ivm-optim.env.local .env.local
+          chmod 600 .env.local
+
+      - name: Build IVM Optim
+        run: npm run build
+
+      - name: Deploy release
+        run: |
+          set -e
+
+          APP=/home/pi/IVM-Optim
+          RELEASE="$APP/releases/${GITHUB_SHA}"
+
+          echo "Creating release:"
+          echo "$RELEASE"
+
+          mkdir -p "$APP/releases"
+
+          rm -rf "$RELEASE"
+          mkdir -p "$RELEASE"
+
+          cp -a dist "$RELEASE/dist"
+          cp package.json "$RELEASE/"
+          cp package-lock.json "$RELEASE/"
+          cp .env.local "$RELEASE/.env.local"
+
+          ln -sfn "$RELEASE" "$APP/current"
+
+          # Keep permanent production environment outside releases too.
+          cp .env.local "$APP/.env.local"
+          chmod 600 "$APP/.env.local"
+
+          echo
+          echo "Current release:"
+          readlink -f "$APP/current"
+
+      - name: Ensure PM2 is available
+        run: |
+          if ! command -v pm2 >/dev/null 2>&1; then
+            echo "PM2 not found. Installing globally."
+            sudo npm install -g pm2
+          fi
+
+          pm2 --version
+
+      - name: Restart IVM Optim
+        run: |
+          set -e
+
+          cd /home/pi/IVM-Optim/current
+
+          if pm2 describe ivm-optim >/dev/null 2>&1; then
+            echo "Restarting existing IVM Optim process."
+            pm2 restart ivm-optim
+          else
+            echo "Starting IVM Optim for the first time."
+
+            pm2 start npm \
+              --name ivm-optim \
+              -- run preview -- \
+              --host 0.0.0.0 \
+              --port 3030 \
+              --strictPort
+          fi
+
+          pm2 save
+
+      - name: Verify application
+        run: |
+          set -e
+
+          echo "Waiting for IVM Optim..."
+          sleep 5
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://127.0.0.1:3030/ \
+            > /dev/null
+
+          echo
+          echo "======================================"
+          echo " IVM OPTIM DEPLOYMENT SUCCESSFUL"
+          echo "======================================"
+          echo
+          echo "Commit: ${GITHUB_SHA}"
+          echo "Server: $(hostname)"
+          echo "Release: $(readlink -f /home/pi/IVM-Optim/current)"
+          echo
+
+          pm2 status ivm-optim
+
+      - name: Cleanup temporary environment
+        if: always()
+        run: |
+          rm -f /tmp/ivm-optim.env.local
