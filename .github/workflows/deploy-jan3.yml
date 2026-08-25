@@ -1,0 +1,111 @@
+name: Deploy IVM Optim to JAN3
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ivm-optim-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to JAN3
+    runs-on:
+      - self-hosted
+      - Linux
+      - ARM64
+      - ivm-optim
+
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout IVM Optim
+        uses: actions/checkout@v4
+
+      - name: Verify deployment
+        run: |
+          echo "======================================"
+          echo " IVM OPTIM — JAN3 DEPLOYMENT"
+          echo "======================================"
+          echo
+          echo "Commit:"
+          git log -1 --oneline
+          echo
+          echo "Host:"
+          hostname
+          echo
+          echo "Node:"
+          node --version
+          echo
+          echo "NPM:"
+          npm --version
+
+      - name: Preserve production environment
+        run: |
+          if [ ! -f /home/pi/IVM-Optim/.env.local ]; then
+            echo "ERROR: /home/pi/IVM-Optim/.env.local does not exist."
+            exit 1
+          fi
+
+          cp /home/pi/IVM-Optim/.env.local /tmp/ivm-optim.env.local
+          chmod 600 /tmp/ivm-optim.env.local
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Restore production environment
+        run: |
+          cp /tmp/ivm-optim.env.local .env.local
+          chmod 600 .env.local
+
+      - name: Build IVM Optim
+        run: npm run build
+
+      - name: Deploy build
+        run: |
+          APP=/home/pi/IVM-Optim
+          RELEASE="$APP/releases/${GITHUB_SHA}"
+
+          mkdir -p "$APP/releases"
+          rm -rf "$RELEASE"
+          mkdir -p "$RELEASE"
+
+          cp -a dist "$RELEASE/dist"
+          cp package.json "$RELEASE/"
+          cp package-lock.json "$RELEASE/"
+          cp .env.local "$RELEASE/.env.local"
+
+          ln -sfn "$RELEASE" "$APP/current"
+
+          echo "Deployed release:"
+          echo "$RELEASE"
+
+      - name: Restart IVM Optim
+        run: |
+          cd /home/pi/IVM-Optim/current
+
+          pm2 restart ivm-optim || \
+          pm2 start "npm run preview -- --host 0.0.0.0 --port 3030 --strictPort" \
+            --name ivm-optim
+
+          pm2 save
+
+      - name: Verify application
+        run: |
+          sleep 5
+
+          curl --fail \
+               --silent \
+               --show-error \
+               http://127.0.0.1:3030/ \
+               > /dev/null
+
+          echo
+          echo "======================================"
+          echo " IVM OPTIM DEPLOYMENT SUCCESSFUL"
+          echo "======================================"
+          echo
+          echo "Commit: ${GITHUB_SHA}"
+          echo "Server: $(hostname)"
+
+          pm2 status ivm-optim
