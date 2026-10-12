@@ -1,6 +1,6 @@
 import { ChangeEvent, useEffect, useMemo, useState } from 'react'
 import { Badge, Card, Field, inputClass } from '../components/ui'
-import { parseCsv, type CsvRow } from '../lib/csv'
+import { parseCsv, toCsv, downloadTextFile, type CsvRow } from '../lib/csv'
 import { supabase } from '../lib/supabase'
 import { Upload, Users, Wrench, Building2, Clock3, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
 
@@ -23,26 +23,31 @@ function parseQuantity(raw:string,fallback:number){
   const n=Number(cleaned)
   return Number.isFinite(n)?n:NaN
 }
+const RESTOCK_HEADERS=['Location','Machine Stocked','Selection','Product','Package Qty','Picked Qty','Picked on Date & Time','Picked From','Restock Person','Restock Action']
 function parseRestockFile(text:string){
   const clean=text.replace(/^\uFEFF/,'')
-  const header='Location,Machine Stocked,Selection,'
-  const idx=clean.indexOf(header)
-  if(idx<0)return {rows:[] as RestockRow[],metadata:{} as Record<string,string>,errors:['RestockSummaryReport header row was not found.']}
+  const lines=clean.split(/\r?\n/)
+  const headerIndex=lines.findIndex(line=>{const h=line.replace(/^\uFEFF/,'').trim();return (h.startsWith('Location,Machine Stocked,Selection') || h.startsWith('Organization,Selection,MFG Item #'))})
+  if(headerIndex<0)return {rows:[] as RestockRow[],metadata:{} as Record<string,string>,errors:['Unrecognized restock CSV headers. Download the CSV Template for the supported format.']}
   const metadata:Record<string,string>={}
-  clean.slice(0,idx).trim().split(/\r?\n/).forEach(line=>{const comma=line.indexOf(',');if(comma>0)metadata[line.slice(0,comma).trim()]=line.slice(comma+1).trim()})
+  lines.slice(0,headerIndex).forEach(line=>{const comma=line.indexOf(',');if(comma>0)metadata[line.slice(0,comma).trim()]=line.slice(comma+1).trim().replace(/^"|"$/g,'')})
+  const isNative=lines[headerIndex].replace(/^\uFEFF/,'').startsWith('Organization,Selection,')
   const rows:RestockRow[]=[];const errors:string[]=[]
-  parseCsv(clean.slice(idx)).forEach((row,i)=>{
-    const sourceMachine=value(row,'Machine Stocked');const sourcePerson=value(row,'Restock Person');const rawDate=value(row,'Picked on Date & Time');const pickedAt=parseDate(rawDate)
-    if(!sourceMachine||!sourcePerson||!pickedAt){errors.push(`Row ${i+2}: missing machine, restock person, or valid date.`);return}
+  parseCsv(lines.slice(headerIndex).join('\n')).forEach((row,i)=>{
+    const sourceMachine=isNative?(metadata.Machine||'').trim():value(row,'Machine Stocked')
+    const sourceLocation=isNative?(metadata.Location||'').trim():value(row,'Location')
+    const sourcePerson=value(row,'Restock Person');const rawDate=value(row,'Picked on Date & Time');const pickedAt=parseDate(rawDate)
+    if(!sourceMachine||!sourcePerson||!pickedAt){errors.push(`Row ${headerIndex+i+2}: missing machine, restock person, or valid date.`);return}
     const pickedQty=parseQuantity(value(row,'Picked Qty'),NaN)
     const packageQty=parseQuantity(value(row,'Package Qty'),1)
-    if(!Number.isFinite(pickedQty)||pickedQty<=0){errors.push(`Row ${i+2}: Picked Qty must be a positive number.`);return}
-    if(!Number.isFinite(packageQty)||packageQty<=0){errors.push(`Row ${i+2}: Package Qty must be a positive number.`);return}
+    if(!Number.isFinite(pickedQty)||pickedQty<=0){errors.push(`Row ${headerIndex+i+2}: Picked Qty must be positive.`);return}
+    if(!Number.isFinite(packageQty)||packageQty<=0){errors.push(`Row ${headerIndex+i+2}: Package Qty must be positive.`);return}
     const key=[sourceMachine,sourcePerson,rawDate,value(row,'Selection'),value(row,'Product'),pickedQty,value(row,'Restock Action')].join('|')
-    rows.push({sourceLocation:value(row,'Location'),sourceMachine,selection:value(row,'Selection'),product:value(row,'Product'),packageQty,pickedQty,pickedAt,pickedFrom:value(row,'Picked From'),sourcePerson,action:value(row,'Restock Action'),importKey:hashText(key)})
+    rows.push({sourceLocation,sourceMachine,selection:value(row,'Selection'),product:value(row,'Product'),packageQty,pickedQty,pickedAt,pickedFrom:value(row,'Picked From'),sourcePerson,action:value(row,'Restock Action'),importKey:hashText(key)})
   })
   return {rows,metadata,errors}
 }
+
 function machineLabel(m:Machine){const loc=m.locations;return `${m.machine_id} — ${loc?.location_name||'Unnamed location'}${loc?.city?` — ${loc.city}${loc.state?`, ${loc.state}`:''}`:''}`}
 function fmt(v:string|null){return v?new Date(v).toLocaleString():'—'}
 
@@ -69,6 +74,23 @@ export default function Staffing(){
   const sourcePeople=useMemo(()=>[...new Set(rows.map(r=>r.sourcePerson))],[rows])
   const mappedMachines=sourceMachines.filter(x=>machineMap[x]&&machineMap[x]!==IGNORE).length;const ignoredMachines=sourceMachines.filter(x=>machineMap[x]===IGNORE).length
   const ready=rows.length>0&&mappedMachines+ignoredMachines===sourceMachines.length
+
+  function downloadTemplate(){downloadTextFile('IVM-Optim-Restock-Template.csv',toCsv([],RESTOCK_HEADERS))}
+  async function exportHistory(){
+    if(!supabase){setMessage('Supabase is not configured.');return}
+    setMessage('Preparing restock history export…')
+    const result:Record<string,unknown>[]=[]
+    for(let offset=0;;offset+=1000){
+      const {data,error}=await supabase.from('restock_events').select('machine_wtn_id,source_location_name,selection_number,product_name,package_quantity,restock_quantity,restock_datetime,picked_from,technician_id,restock_action').order('restock_datetime',{ascending:false}).range(offset,offset+999)
+      if(error){setMessage(`Export failed: ${error.message}`);return}
+      if(!data?.length)break
+      result.push(...data)
+      if(data.length<1000)break
+    }
+    const csvRows=result.map(r=>({Location:r.source_location_name,'Machine Stocked':r.machine_wtn_id,Selection:r.selection_number,Product:r.product_name,'Package Qty':r.package_quantity,'Picked Qty':r.restock_quantity,'Picked on Date & Time':r.restock_datetime,'Picked From':r.picked_from,'Restock Person':`Anonymous ${String(r.technician_id||'').slice(0,8)}`,'Restock Action':r.restock_action}))
+    downloadTextFile('IVM-Optim-Restock-History.csv',toCsv(csvRows,RESTOCK_HEADERS))
+    setMessage(`Exported ${result.length.toLocaleString()} restock rows with anonymized personnel identifiers.`)
+  }
 
   async function chooseFile(e:ChangeEvent<HTMLInputElement>){const file=e.target.files?.[0];if(!file)return;const parsed=parseRestockFile(await file.text());setRows(parsed.rows);setMetadata(parsed.metadata);setErrors(parsed.errors);setFilename(file.name);const mm:Record<string,string>={};for(const source of [...new Set(parsed.rows.map(r=>r.sourceMachine))]){const alias=machineAliases.find(a=>normalize(a.source_machine_name)===normalize(source));if(alias?.ignored)mm[source]=IGNORE;else if(alias?.machine_uuid)mm[source]=alias.machine_uuid;else{const ranked=machines.map(m=>({id:m.id,score:Math.max(normalize(source)===normalize(m.locations?.location_name||'')?1:0,normalize(source)===normalize(m.machine_id)?1:0,normalize(source).includes(normalize(m.locations?.location_name||''))?.9:0)})).sort((a,b)=>b.score-a.score);if(ranked[0]?.score>=.9)mm[source]=ranked[0].id}}
     setMachineMap(mm);setMessage(`${parsed.rows.length.toLocaleString()} restock rows found. ${new Set(parsed.rows.map(r=>r.sourcePerson)).size} anonymous technician code(s) will be assigned automatically.`)}
@@ -120,7 +142,7 @@ export default function Staffing(){
 
   return <div className="space-y-6"><div><h1 className="text-2xl font-extrabold text-slate-900">Staffing & Restock Operations</h1><p className="text-slate-500">Use replenishment history to estimate anonymous technician coverage, workload, visit demand, and service capacity.</p></div>
     {message&&<div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">{message}</div>}
-    <Card><div className="flex items-center gap-2"><Upload size={18} className="text-blue-600"/><h2 className="font-bold">Import Restock Summary</h2></div><p className="mt-1 text-sm text-slate-500">Upload the Restock Summary Report CSV and cross-reference only the source machines. Restock personnel are converted into stable anonymous technician codes automatically.</p><div className="mt-4 flex gap-3"><input type="file" accept=".csv,text/csv" className={inputClass} onChange={chooseFile}/><button disabled={!ready||importing} onClick={importRows} className="rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-bold text-white disabled:bg-slate-300">{importing?'Importing…':'Import Restocks'}</button></div>{filename&&<p className="mt-2 text-xs text-slate-500">{filename} • {metadata.Account||'Account not listed'} • {rows.length} rows • {sourcePeople.length} anonymous technician(s)</p>}{errors.length>0&&<p className="mt-2 text-xs text-rose-600">{errors.slice(0,3).join(' ')}</p>}</Card>
+    <Card><div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2"><Upload size={18} className="text-blue-600"/><h2 className="font-bold">Import Restock Summary</h2></div><div className="flex flex-wrap gap-2"><button type="button" onClick={downloadTemplate} className="rounded-xl border border-slate-300 px-3 py-2 text-sm font-semibold">CSV Template</button><button type="button" onClick={()=>void exportHistory()} className="rounded-xl border border-slate-300 px-3 py-2 text-sm font-semibold">Export Restock History</button></div></div><p className="mt-1 text-sm text-slate-500">Upload the Restock Summary Report CSV and cross-reference only the source machines. Restock personnel are converted into stable anonymous technician codes automatically.</p><div className="mt-4 flex flex-wrap gap-3"><input type="file" accept=".csv,text/csv" className={inputClass} onChange={chooseFile}/><button disabled={!ready||importing} onClick={importRows} className="rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-bold text-white disabled:bg-slate-300">{importing?'Importing…':'Import Restocks'}</button></div>{filename&&<p className="mt-2 text-xs text-slate-500">{filename} • {metadata.Account||'Account not listed'} • {rows.length} rows • {sourcePeople.length} anonymous technician(s)</p>}{errors.length>0&&<p className="mt-2 text-xs text-rose-600">{errors.slice(0,3).join(' ')}</p>}</Card>
     {rows.length>0&&<Card><section><h2 className="font-bold">Match Source Machines</h2><div className="mt-3 grid gap-3 lg:grid-cols-2">{sourceMachines.map(source=><Field key={source} label={source}><select className={inputClass} value={machineMap[source]||''} onChange={e=>setMachineMap(p=>({...p,[source]:e.target.value}))}><option value="">Select WTN machine and location</option><option value={IGNORE}>Not applicable — Ignore</option>{machines.map(m=><option key={m.id} value={m.id}>{machineLabel(m)}</option>)}</select></Field>)}</div></section><div className="mt-4 flex flex-wrap items-center gap-2 text-sm"><Badge tone={ready?'green':'yellow'}>{ready?'Ready to import':'Machine mapping required'}</Badge><span>{mappedMachines} machines mapped</span><span>• {ignoredMachines} ignored</span><span>• {sourcePeople.length} anonymous technicians detected</span><label className="ml-auto flex items-center gap-2"><input type="checkbox" checked={remember} onChange={e=>setRemember(e.target.checked)}/> Remember machine mappings</label></div></Card>}
     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{[[Users,'Anonymous Technicians',techSummary.length],[Wrench,'Restock Visits',techSummary.reduce((a,b)=>a+Number(b.visit_count||0),0)],[Building2,'Machines Serviced',new Set(machineSummary.map(x=>x.machine_uuid)).size],[Clock3,'Estimated Hours',techSummary.reduce((a,b)=>a+Number(b.estimated_hours||0),0).toFixed(1)]].map(([Icon,label,val]:any)=><Card key={label} className="p-4"><Icon size={18} className="text-blue-600"/><p className="mt-3 text-xs font-bold uppercase text-slate-500">{label}</p><p className="text-2xl font-extrabold">{val}</p></Card>)}</div>
     <section className="space-y-4"><div><h2 className="text-lg font-bold text-slate-900">Machine Service Demand</h2><p className="text-sm text-slate-500">Machines are grouped by agency. Expand a machine to see the anonymous technicians who serviced it and their workload contribution.</p></div>
