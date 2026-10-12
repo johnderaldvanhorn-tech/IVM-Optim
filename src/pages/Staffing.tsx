@@ -40,7 +40,7 @@ function parseRestockFile(text:string){
     if(!sourceMachine||!sourcePerson||!pickedAt){errors.push(`Row ${headerIndex+i+2}: missing machine, restock person, or valid date.`);return}
     const pickedQty=parseQuantity(value(row,'Picked Qty'),NaN)
     const packageQty=parseQuantity(value(row,'Package Qty'),1)
-    if(!Number.isFinite(pickedQty)||pickedQty===0){errors.push(`Row ${headerIndex+i+2}: Picked Qty must be a nonzero number.`);return}
+    if(!Number.isFinite(pickedQty)){errors.push(`Row ${headerIndex+i+2}: Picked Qty must be a valid number (negative, zero, or positive).`);return}
     if(!Number.isFinite(packageQty)||packageQty<=0){errors.push(`Row ${headerIndex+i+2}: Package Qty must be positive.`);return}
     const key=[sourceMachine,sourcePerson,rawDate,value(row,'Selection'),value(row,'Product'),pickedQty,value(row,'Restock Action')].join('|')
     rows.push({sourceLocation,sourceMachine,selection:value(row,'Selection'),product:value(row,'Product'),packageQty,pickedQty,pickedAt,pickedFrom:value(row,'Picked From'),sourcePerson,action:value(row,'Restock Action'),importKey:hashText(key)})
@@ -99,7 +99,7 @@ export default function Staffing(){
 
   async function importRows(){if(!supabase||!ready)return;setImporting(true);setMessage('Assigning anonymous technician codes and importing restock history…');try{
     const anonymousTechs=await resolveAnonymousTechnicians()
-    const payload=rows.filter(r=>machineMap[r.sourceMachine]!==IGNORE&&Number.isFinite(r.pickedQty)&&r.pickedQty!==0&&Number.isFinite(r.packageQty)&&r.packageQty>0).map(r=>{const m=machines.find(x=>x.id===machineMap[r.sourceMachine]);const tech=anonymousTechs[r.sourcePerson];return {machine_uuid:m?.id,machine_wtn_id:m?.machine_id,technician_id:tech.technician_id,source_machine_name:r.sourceMachine,source_location_name:r.sourceLocation,source_restock_person:r.sourcePerson,selection_number:r.selection,product_name:r.product,package_quantity:r.packageQty,restock_quantity:r.pickedQty,restock_datetime:r.pickedAt,picked_from:r.pickedFrom,restock_action:r.action,source_file:filename,import_key:r.importKey}})
+    const payload=rows.filter(r=>machineMap[r.sourceMachine]!==IGNORE&&Number.isFinite(r.pickedQty)&&Number.isFinite(r.packageQty)&&r.packageQty>0).map(r=>{const m=machines.find(x=>x.id===machineMap[r.sourceMachine]);const tech=anonymousTechs[r.sourcePerson];return {machine_uuid:m?.id,machine_wtn_id:m?.machine_id,technician_id:tech.technician_id,source_machine_name:r.sourceMachine,source_location_name:r.sourceLocation,source_restock_person:r.sourcePerson,selection_number:r.selection,product_name:r.product,package_quantity:r.packageQty,restock_quantity:r.pickedQty,restock_datetime:r.pickedAt,picked_from:r.pickedFrom,restock_action:r.action,source_file:filename,import_key:r.importKey}})
     for(let i=0;i<payload.length;i+=500){const {error}=await supabase.from('restock_events').upsert(payload.slice(i,i+500),{onConflict:'import_key'});if(error)throw error}
     if(remember){const machineAliasPayload=sourceMachines.map(source=>({source_machine_name:source,machine_uuid:machineMap[source]===IGNORE?null:machineMap[source],ignored:machineMap[source]===IGNORE,updated_at:new Date().toISOString()}));const a=await supabase.from('restock_machine_aliases').upsert(machineAliasPayload,{onConflict:'source_machine_name'});if(a.error)throw a.error}
     setMessage(`Imported ${payload.length.toLocaleString()} restock rows using ${Object.keys(anonymousTechs).length} anonymous technician code(s). Ignored ${rows.length-payload.length}.`);await loadData()
