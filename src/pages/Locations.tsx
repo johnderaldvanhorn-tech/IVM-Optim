@@ -350,9 +350,10 @@ export default function Locations() {
     </div>
 
     <Card className="p-3">
-      <div className="flex flex-wrap items-center gap-2 xl:flex-nowrap">
+      <div className="flex min-w-0 flex-col gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
         <input
-          className={`${inputClass} min-w-[280px] flex-1 py-2`}
+          className={`${inputClass} w-full min-w-0 flex-1 basis-64 py-2`}
           placeholder="Search agencies, facilities, machine IDs, cities, or ZIP..."
           value={query}
           onChange={(event) => setQuery(event.target.value)}
@@ -362,10 +363,13 @@ export default function Locations() {
           <button onClick={() => setView('map')} className={`inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-semibold ${view === 'map' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}><MapIcon size={15}/>Map</button>
         </div>
         <Link to="/locations/new" className="inline-flex shrink-0 items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"><Plus size={17}/>Add Location</Link>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
         <button onClick={() => fileRef.current?.click()} disabled={loading} className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-blue-200 bg-white px-4 py-2 text-sm font-semibold text-blue-700 hover:bg-blue-50 disabled:opacity-50"><Upload size={17}/>Import / Update CSV</button>
         <button onClick={exportLocations} className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"><Download size={17}/>Export CSV</button>
         <button onClick={downloadTemplate} className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"><FileDown size={17}/>CSV Template</button>
         <input ref={fileRef} type="file" accept=".csv,text/csv" className="hidden" onChange={importLocations}/>
+        </div>
       </div>
       {view === 'map' && <div className="mt-2 flex justify-end"><select className={`${inputClass} max-w-xs py-2`} value={mapMetric} onChange={(event) => setMapMetric(event.target.value as 'accessibility' | 'risk' | 'maximum')}><option value="maximum">Maximum Location Score</option><option value="accessibility">Accessibility Score</option><option value="risk">Risk Score</option></select></div>}
       {!isSupabaseConfigured && <p className="mt-2 text-xs font-medium text-amber-700">Supabase connection is not configured in this browser session.</p>}
