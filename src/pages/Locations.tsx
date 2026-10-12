@@ -5,16 +5,25 @@ import { Badge, Card, inputClass } from '../components/ui'
 import { downloadTextFile, parseCsv, toCsv, type CsvRow } from '../lib/csv'
 import { isSupabaseConfigured, supabase } from '../lib/supabase'
 import LocationMap from '../components/LocationMap'
+import { calculateAccessibilityScore, calculateRiskScore, calculateMaximumLocationScore, classifyUrbanRural, temporalAccessScore } from '../lib/calculations'
 
 type MachineStatus = 'Planned' | 'Active' | 'Inactive' | 'Removed'
 
 type LocationDemographicRecord = {
+  zip_population?: number | null
+  population_density?: number | null
+  zip_crime_rate?: number | null
+  usda_hardiness_zone?: number | null
   risk_score: number | null
   maximum_location_score?: number | null
   urban_rural_flag?: string | null
 }
 
 type LocationAccessRecord = {
+  public_access_score?: number | null
+  physical_access_score?: number | null
+  accessible_hours_per_week?: number | null
+  visibility_score?: number | null
   machine_accessibility_score: number | null
 }
 
@@ -48,6 +57,8 @@ type AgencyGroup = { agency: string; rows: LocationRecord[] }
 const headers = [
   'machine_id', 'agency', 'location_name', 'address', 'city', 'state', 'zip', 'latitude', 'longitude',
   'contact_name', 'contact_phone', 'contact_email', 'machine_status', 'cluster_id', 'population_served',
+  'public_access_score', 'physical_access_score', 'accessible_hours_per_week', 'visibility_score',
+  'zip_population', 'population_density', 'zip_crime_rate', 'usda_hardiness_zone',
 ]
 
 const statuses: MachineStatus[] = ['Planned', 'Active', 'Inactive', 'Removed']
@@ -175,7 +186,7 @@ export default function Locations() {
 
     const { data, error } = await supabase
       .from('locations')
-      .select('*, location_access_scores(machine_accessibility_score), location_demographics(risk_score, maximum_location_score, urban_rural_flag)')
+      .select('*, location_access_scores(*), location_demographics(*)')
       .order('agency', { ascending: true })
       .order('machine_id', { ascending: true })
 
@@ -234,9 +245,54 @@ export default function Locations() {
     }
   }
 
-  const exportLocations = () => downloadTextFile(`ivm-optim-locations-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(filtered as unknown as Record<string, unknown>[], headers))
+  const assessmentFields = ['public_access_score', 'physical_access_score', 'accessible_hours_per_week', 'visibility_score', 'zip_population', 'population_density', 'zip_crime_rate', 'usda_hardiness_zone'] as const
+  const accessCategories: Record<string, Record<string, string>> = {
+    public_access_score: { '1': 'Fully public', '0.8': 'Time-limited public', '0.5': 'Semi-public', '0.2': 'Private/gated', '0': 'Highly restricted' },
+    physical_access_score: { '1': 'Indoor, step-free', '0.8': 'Outdoor, step-free', '0.5': 'Minor barriers', '0.2': 'Significant barriers', '0': 'Inaccessible' },
+    visibility_score: { '1': 'High', '0.6': 'Moderate', '0.3': 'Low', '0': 'Hidden' },
+  }
+  const validateAssessment = (row: CsvRow): string | null => {
+    for (const key of assessmentFields) {
+      const raw = row[key]?.trim()
+      if (!raw) continue
+      const value = Number(raw)
+      if (!Number.isFinite(value)) return `${key} must be numeric.`
+      if (accessCategories[key] && !(String(value) in accessCategories[key])) return `${key} must be one of ${Object.keys(accessCategories[key]).join(', ')}.`
+      if (key === 'accessible_hours_per_week' && (value < 0 || value > 168)) return `${key} must be between 0 and 168.`
+      if (key === 'zip_crime_rate' && (value < 0 || value > 100)) return `${key} must be between 0 and 100.`
+      if (key === 'usda_hardiness_zone' && (value < 1 || value > 13)) return `${key} must be between 1 and 13.`
+      if (['zip_population', 'population_density'].includes(key) && value < 0) return `${key} cannot be negative.`
+    }
+    return null
+  }
+  const saveAssessment = async (machineId: string, csv: CsvRow, locationId: string) => {
+    if (!supabase || !assessmentFields.some((key) => csv[key]?.trim())) return
+    const [{ data: access, error: accessReadError }, { data: demo, error: demoReadError }] = await Promise.all([
+      supabase.from('location_access_scores').select('*').eq('location_id', locationId).maybeSingle(),
+      supabase.from('location_demographics').select('*').eq('location_id', locationId).maybeSingle(),
+    ])
+    if (accessReadError || demoReadError) throw new Error(`${machineId}: ${accessReadError?.message || demoReadError?.message}`)
+    const val = (key: typeof assessmentFields[number], existing: number | null | undefined, fallback: number) => csv[key]?.trim() ? Number(csv[key]) : Number(existing ?? fallback)
+    const pub = val('public_access_score', access?.public_access_score, 1)
+    const phys = val('physical_access_score', access?.physical_access_score, 1)
+    const hours = val('accessible_hours_per_week', access?.accessible_hours_per_week, 168)
+    const visibility = val('visibility_score', access?.visibility_score, 1)
+    const population = val('zip_population', demo?.zip_population, 0)
+    const density = val('population_density', demo?.population_density, 0)
+    const crime = val('zip_crime_rate', demo?.zip_crime_rate, 0)
+    const zone = val('usda_hardiness_zone', demo?.usda_hardiness_zone, 5)
+    const accessibility = calculateAccessibilityScore({ publicAccess: pub, physicalAccess: phys, hours, visibility }, { publicAccess: .35, physicalAccess: .25, temporalAccess: .2, visibility: .2 })
+    const risk = calculateRiskScore({ population, crime, zone }, { populationMin: 0, populationMax: 100000, crimeMin: 0, crimeMax: 100, zoneMin: 1, zoneMax: 13, zoneMid: 7 }, { population: .3, crime: .5, climate: .2 })
+    const accessPayload = { location_id: locationId, availability_tier: access?.availability_tier ?? 'High', public_access_category: accessCategories.public_access_score[String(pub)], public_access_score: pub, physical_access_category: accessCategories.physical_access_score[String(phys)], physical_access_score: phys, accessible_hours_per_week: hours, temporal_access_score: temporalAccessScore(hours), visibility_category: accessCategories.visibility_score[String(visibility)], visibility_score: visibility, machine_accessibility_score: accessibility }
+    const demoPayload = { location_id: locationId, housing_unit_density: demo?.housing_unit_density ?? 0, population_density: density, contiguous_housing_units: demo?.contiguous_housing_units ?? 0, contiguous_population: demo?.contiguous_population ?? 0, urban_rural_flag: classifyUrbanRural({ populationDensity: density }), zip_population: population, zip_crime_rate: crime, usda_hardiness_zone: zone, normalized_population_score: risk.normalizedPopulation, normalized_crime_score: risk.normalizedCrime, normalized_climate_risk_score: risk.normalizedClimate, risk_score: risk.riskScore, maximum_location_score: calculateMaximumLocationScore(accessibility, risk.riskScore) }
+    const a = await supabase.from('location_access_scores').upsert(accessPayload, { onConflict: 'location_id' })
+    if (a.error) throw new Error(`${machineId}: accessibility save failed: ${a.error.message}`)
+    const d = await supabase.from('location_demographics').upsert(demoPayload, { onConflict: 'location_id' })
+    if (d.error) throw new Error(`${machineId}: demographics save failed: ${d.error.message}`)
+  }
+  const exportLocations = () => downloadTextFile(`ivm-optim-locations-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(filtered.map((row) => ({ ...row, ...relatedRecord(row.location_access_scores), ...relatedRecord(row.location_demographics) })) as Record<string, unknown>[], headers))
   const downloadTemplate = () => downloadTextFile('ivm-optim-location-import-template.csv', toCsv([{
-    machine_id: 'IVM-100', agency: 'Example Agency', location_name: 'Example Facility', address: '123 Main St', city: 'Des Moines', state: 'IA', zip: '50309', latitude: '41.5868', longitude: '-93.6250', contact_name: '', contact_phone: '', contact_email: '', machine_status: 'Planned', cluster_id: '', population_served: '10000',
+    machine_id: 'IVM-100', agency: 'Example Agency', location_name: 'Example Facility', address: '123 Main St', city: 'Des Moines', state: 'IA', zip: '50309', latitude: '41.5868', longitude: '-93.6250', contact_name: '', contact_phone: '', contact_email: '', machine_status: 'Planned', cluster_id: '', population_served: '10000', public_access_score: '1', physical_access_score: '1', accessible_hours_per_week: '168', visibility_score: '1', zip_population: '19076', population_density: '1500', zip_crime_rate: '88', usda_hardiness_zone: '5',
   }], headers))
 
   const importLocations = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -248,18 +304,41 @@ export default function Locations() {
       const parsed = parseCsv(await file.text())
       const missingHeaders = ['machine_id', 'agency', 'location_name'].filter((header) => !Object.prototype.hasOwnProperty.call(parsed[0] ?? {}, header))
       if (missingHeaders.length) throw new Error(`Missing required CSV column(s): ${missingHeaders.join(', ')}`)
-      const records: LocationRecord[] = []; const issues: ImportIssue[] = []
-      parsed.forEach((row, index) => { const result = validateAndMap(row, index + 2); if (result.record) records.push(result.record); if (result.issue) issues.push(result.issue) })
+      const records: { record: LocationRecord; csv: CsvRow; rowNumber: number }[] = []
+      const issues: ImportIssue[] = []
+      const seen = new Set<string>()
+      parsed.forEach((row, index) => {
+        const result = validateAndMap(row, index + 2)
+        const problem = validateAssessment(row)
+        const machineId = row.machine_id?.trim() ?? ''
+        if (result.issue) issues.push(result.issue)
+        else if (problem) issues.push({ row: index + 2, machineId, message: problem })
+        else if (seen.has(machineId)) issues.push({ row: index + 2, machineId, message: 'Duplicate machine_id in CSV.' })
+        else if (result.record) { seen.add(machineId); records.push({ record: result.record, csv: row, rowNumber: index + 2 }) }
+      })
+      let accepted = 0
       if (!supabase) {
-        setRows((current) => { const byMachine = new Map(current.map((row) => [row.machine_id, row])); records.forEach((record) => byMachine.set(record.machine_id, record)); return [...byMachine.values()].sort((a, b) => a.machine_id.localeCompare(b.machine_id)) })
-        setMessage('Preview completed locally. Configure Supabase and sign in as an Admin or Program Manager to save imported records.')
-      } else if (records.length) {
-        const { error } = await supabase.from('locations').upsert(records, { onConflict: 'machine_id' })
-        if (error) throw error
-        setMessage(`${records.length} location record${records.length === 1 ? '' : 's'} inserted or updated.`)
+        setRows((current) => { const byMachine = new Map(current.map((row) => [row.machine_id, row])); records.forEach(({ record }) => byMachine.set(record.machine_id, record)); return [...byMachine.values()].sort((a, b) => a.machine_id.localeCompare(b.machine_id)) })
+        accepted = records.length
+        setMessage('Preview completed locally. Configure Supabase and sign in to save imported records.')
+      } else {
+        for (const { record, csv, rowNumber } of records) {
+          try {
+            // Merge existing values so empty optional columns do not erase data.
+            const { data: existing, error: lookupError } = await supabase.from('locations').select('*').eq('machine_id', record.machine_id).maybeSingle()
+            if (lookupError) throw lookupError
+            const merged = { ...record } as Record<string, unknown>
+            if (existing) for (const key of headers.slice(1, 15)) if (!csv[key]?.trim()) merged[key] = existing[key]
+            const { data: saved, error } = await supabase.from('locations').upsert(merged, { onConflict: 'machine_id' }).select('id').single()
+            if (error) throw error
+            await saveAssessment(record.machine_id, csv, saved.id)
+            accepted++
+          } catch (error) { issues.push({ row: rowNumber, machineId: record.machine_id, message: error instanceof Error ? error.message : 'Save failed.' }) }
+        }
+        setMessage(`${accepted} location record(s) saved; ${issues.length} rejected or partially failed. Review errors before retrying.`)
         await loadLocations()
       }
-      setSummary({ total: parsed.length, accepted: records.length, rejected: issues.length, issues })
+      setSummary({ total: parsed.length, accepted, rejected: issues.length, issues })
     } catch (error) { setMessage(error instanceof Error ? error.message : 'The CSV could not be imported.') }
     finally { setLoading(false) }
   }
