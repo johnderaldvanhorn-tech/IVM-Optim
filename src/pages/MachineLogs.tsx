@@ -1,7 +1,7 @@
 import { ChangeEvent, useEffect, useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight, ScrollText } from 'lucide-react'
 import { Badge, Card, Field, inputClass } from '../components/ui'
-import { parseCsv, type CsvRow } from '../lib/csv'
+import { downloadTextFile, parseCsv, toCsv, type CsvRow } from '../lib/csv'
 import { supabase } from '../lib/supabase'
 
 type Machine = {
@@ -93,49 +93,55 @@ function hashText(value: string) {
 }
 
 function parseLogDate(value: string): string | null {
-  const match = value.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)$/i)
+  const match = value.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i)
   if (!match) return null
-  const [, month, day, year, hourText, minute, ampm] = match
-  let hour = Number(hourText)
-  if (ampm.toUpperCase() === 'PM' && hour !== 12) hour += 12
-  if (ampm.toUpperCase() === 'AM' && hour === 12) hour = 0
-  const local = new Date(Number(year), Number(month) - 1, Number(day), hour, Number(minute), 0)
-  return Number.isNaN(local.getTime()) ? null : local.toISOString()
+  const [, mm, dd, yy, hh, min, sec, period] = match
+  const year = yy.length === 2 ? 2000 + Number(yy) : Number(yy)
+  let hour = Number(hh)
+  if (period) {
+    if (hour < 1 || hour > 12) return null
+    hour = hour % 12 + (period.toUpperCase() === 'PM' ? 12 : 0)
+  }
+  const month = Number(mm), day = Number(dd), minute = Number(min), second = Number(sec || 0)
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return null
+  const local = new Date(year, month - 1, day, hour, minute, second)
+  if (local.getFullYear() !== year || local.getMonth() !== month - 1 || local.getDate() !== day) return null
+  return local.toISOString()
 }
 
+const headerName = (name: string) => name.trim().replace(/^\uFEFF/, '').toLowerCase().replace(/[^a-z0-9]/g, '')
 function value(row: CsvRow, header: string) {
-  return (row[header] || '').trim()
+  const key = Object.keys(row).find(candidate => headerName(candidate) === headerName(header))
+  return (key ? row[key] : '')?.trim() || ''
 }
-
+const LOG_HEADERS = ['Date & Time','Action','Selection','Product','Employee','Passcode','Quantity','Message','Status','Type','Scale Serial','Scale Variance','Employee #','Error Type','Question Name','Question No','Question','Dispense Type','Answer']
 function parseMachineLogFile(text: string): { rows: ParsedLog[]; metadata: Record<string, string>; errors: string[] } {
-  const normalizedText = text.replace(/^\uFEFF/, '')
-  const headerIndex = normalizedText.search(/(?:^|\r?\n)Location,Machine,Date & Time,Action,/)
-  if (headerIndex < 0) return { rows: [], metadata: {}, errors: ['The MachineLogs header row was not found.'] }
-
-  const preamble = normalizedText.slice(0, headerIndex).trim()
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/)
+  const headerIndex = lines.findIndex(line => {
+    const headers = line.split(',').map(headerName)
+    return headers.includes('datetime') && headers.includes('action')
+  })
+  if (headerIndex < 0) return { rows: [], metadata: {}, errors: ['No machine log header found. Required columns: Date & Time, Action.'] }
   const metadata: Record<string, string> = {}
-  for (const line of preamble.split(/\r?\n/)) {
+  for (const line of lines.slice(0, headerIndex)) {
     const comma = line.indexOf(',')
     if (comma > 0) metadata[line.slice(0, comma).trim()] = line.slice(comma + 1).trim()
   }
-
-  const dataText = normalizedText.slice(headerIndex).replace(/^\r?\n/, '')
-  const csvRows = parseCsv(dataText)
+  const csvRows = parseCsv(lines.slice(headerIndex).join('\n'))
   const errors: string[] = []
   const rows: ParsedLog[] = []
-
   csvRows.forEach((row, index) => {
-    const sourceMachine = value(row, 'Machine')
+    const sourceMachine = value(row, 'Machine') || value(row, 'Machine Stocked') || metadata.Machine || metadata['Machine Stocked'] || 'Unspecified source machine — select destination'
     const rawDate = value(row, 'Date & Time')
     const eventDatetime = parseLogDate(rawDate)
-    if (!sourceMachine || !eventDatetime) {
-      errors.push(`Row ${index + 2}: missing machine name or invalid Date & Time.`)
+    if (!eventDatetime || !value(row, 'Action')) {
+      errors.push(`Row ${headerIndex + index + 2}: invalid Date & Time or missing Action.`)
       return
     }
-    const keySource = [sourceMachine, rawDate, value(row, 'Action'), value(row, 'Selection'), value(row, 'Employee'), value(row, 'Quantity'), value(row, 'Message'), value(row, 'Status'), value(row, 'Employee #')].join('|')
+    const keySource = [sourceMachine, eventDatetime, ...LOG_HEADERS.slice(1).map(header => value(row, header))].join('|')
     rows.push({
       sourceMachine,
-      sourceLocation: value(row, 'Location'),
+      sourceLocation: value(row, 'Location') || metadata.Location || '',
       eventDatetime,
       action: value(row, 'Action'),
       selection: value(row, 'Selection'),
@@ -155,7 +161,7 @@ function parseMachineLogFile(text: string): { rows: ParsedLog[]; metadata: Recor
       question: value(row, 'Question'),
       dispenseType: value(row, 'Dispense Type'),
       answer: value(row, 'Answer'),
-      importKey: `${hashText(keySource)}-${index + 1}`,
+      importKey: hashText(keySource) + '-' + String(index + 1),
     })
   })
   return { rows, metadata, errors }
@@ -263,7 +269,7 @@ export default function MachineLogs() {
           return { machine, score: Math.max(...candidates.map(candidate => similarity(source, candidate))) }
         })
         .sort((a, b) => b.score - a.score)
-      nextMapping[source] = ranked[0]?.score >= 0.72 ? ranked[0].machine.id : ''
+      nextMapping[source] = source.startsWith('Unspecified source machine') ? '' : ranked[0]?.score >= 0.72 ? ranked[0].machine.id : ''
     }
     setMapping(nextMapping)
   }
@@ -281,7 +287,7 @@ export default function MachineLogs() {
     setMessage('Importing machine events…')
 
     const importableRows = parsedRows.filter(row => mapping[row.sourceMachine] !== IGNORE_MAPPING)
-    if (!importableRows.length) return setMessage('Every source machine is ignored. There are no rows to import.')
+    if (!importableRows.length) { setImporting(false); return setMessage('Every source machine is ignored. There are no rows to import.') }
 
     const machinesById = new Map(machines.map(machine => [machine.id, machine]))
     const payload = importableRows.map(row => {
@@ -398,6 +404,7 @@ export default function MachineLogs() {
     {message && <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">{message}</div>}
 
     <Card>
+      <div className="mb-4 flex flex-wrap gap-2"><button type="button" className="rounded-xl border border-blue-300 px-4 py-2 text-sm font-semibold text-blue-700" onClick={() => downloadTextFile('IVM-Optim-MachineLogs-Template.csv', toCsv([Object.fromEntries(LOG_HEADERS.map(header => [header, '']))], LOG_HEADERS))}>CSV Template</button></div>
       <div className="grid gap-5 lg:grid-cols-[1fr_auto] lg:items-end">
         <Field label="Machine log CSV"><input className={inputClass} type="file" accept=".csv,text/csv" onChange={chooseFile} /></Field>
         <button onClick={importLogs} disabled={importing || !parsedRows.length || unmapped.length > 0} className="rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-slate-300">{importing ? 'Importing…' : 'Import Logs'}</button>
