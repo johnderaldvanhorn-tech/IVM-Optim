@@ -27,20 +27,20 @@ const RESTOCK_HEADERS=['Location','Machine Stocked','Selection','Product','Packa
 function parseRestockFile(text:string){
   const clean=text.replace(/^\uFEFF/,'')
   const lines=clean.split(/\r?\n/)
-  const headerIndex=lines.findIndex(line=>{const h=line.replace(/^\uFEFF/,'').trim();return (h.startsWith('Location,Machine Stocked,Selection') || h.startsWith('Organization,Selection,MFG Item #'))})
+  const headerIndex=lines.findIndex(line=>{const fields=line.replace(/^\uFEFF/,'').split(',').map(h=>normalize(h.replace(/^"|"$/g,'')));return ['selection','pickedqty','pickedondatetime','restockperson'].every(h=>fields.includes(h)) && (fields.includes('machinestocked') || fields.includes('organization'))})
   if(headerIndex<0)return {rows:[] as RestockRow[],metadata:{} as Record<string,string>,errors:['Unrecognized restock CSV headers. Download the CSV Template for the supported format.']}
   const metadata:Record<string,string>={}
   lines.slice(0,headerIndex).forEach(line=>{const comma=line.indexOf(',');if(comma>0)metadata[line.slice(0,comma).trim()]=line.slice(comma+1).trim().replace(/^"|"$/g,'')})
-  const isNative=lines[headerIndex].replace(/^\uFEFF/,'').startsWith('Organization,Selection,')
+  const hasMachineColumn=lines[headerIndex].split(',').some(h=>normalize(h)==='machinestocked')
   const rows:RestockRow[]=[];const errors:string[]=[]
   parseCsv(lines.slice(headerIndex).join('\n')).forEach((row,i)=>{
-    const sourceMachine=isNative?(metadata.Machine||'').trim():value(row,'Machine Stocked')
-    const sourceLocation=isNative?(metadata.Location||'').trim():value(row,'Location')
+    const sourceMachine=hasMachineColumn?value(row,'Machine Stocked'):(metadata.Machine||'').trim()
+    const sourceLocation=value(row,'Location')||(metadata.Location||'').trim()
     const sourcePerson=value(row,'Restock Person');const rawDate=value(row,'Picked on Date & Time');const pickedAt=parseDate(rawDate)
     if(!sourceMachine||!sourcePerson||!pickedAt){errors.push(`Row ${headerIndex+i+2}: missing machine, restock person, or valid date.`);return}
     const pickedQty=parseQuantity(value(row,'Picked Qty'),NaN)
     const packageQty=parseQuantity(value(row,'Package Qty'),1)
-    if(!Number.isFinite(pickedQty)||pickedQty<=0){errors.push(`Row ${headerIndex+i+2}: Picked Qty must be positive.`);return}
+    if(!Number.isFinite(pickedQty)||pickedQty===0){errors.push(`Row ${headerIndex+i+2}: Picked Qty must be a nonzero number.`);return}
     if(!Number.isFinite(packageQty)||packageQty<=0){errors.push(`Row ${headerIndex+i+2}: Package Qty must be positive.`);return}
     const key=[sourceMachine,sourcePerson,rawDate,value(row,'Selection'),value(row,'Product'),pickedQty,value(row,'Restock Action')].join('|')
     rows.push({sourceLocation,sourceMachine,selection:value(row,'Selection'),product:value(row,'Product'),packageQty,pickedQty,pickedAt,pickedFrom:value(row,'Picked From'),sourcePerson,action:value(row,'Restock Action'),importKey:hashText(key)})
@@ -93,13 +93,13 @@ export default function Staffing(){
   }
 
   async function chooseFile(e:ChangeEvent<HTMLInputElement>){const file=e.target.files?.[0];if(!file)return;const parsed=parseRestockFile(await file.text());setRows(parsed.rows);setMetadata(parsed.metadata);setErrors(parsed.errors);setFilename(file.name);const mm:Record<string,string>={};for(const source of [...new Set(parsed.rows.map(r=>r.sourceMachine))]){const alias=machineAliases.find(a=>normalize(a.source_machine_name)===normalize(source));if(alias?.ignored)mm[source]=IGNORE;else if(alias?.machine_uuid)mm[source]=alias.machine_uuid;else{const ranked=machines.map(m=>({id:m.id,score:Math.max(normalize(source)===normalize(m.locations?.location_name||'')?1:0,normalize(source)===normalize(m.machine_id)?1:0,normalize(source).includes(normalize(m.locations?.location_name||''))?.9:0)})).sort((a,b)=>b.score-a.score);if(ranked[0]?.score>=.9)mm[source]=ranked[0].id}}
-    setMachineMap(mm);setMessage(`${parsed.rows.length.toLocaleString()} restock rows found. ${new Set(parsed.rows.map(r=>r.sourcePerson)).size} anonymous technician code(s) will be assigned automatically.`)}
+    setMachineMap(mm);setMessage(`${parsed.rows.length.toLocaleString()} restock rows found (${parsed.rows.filter(r=>r.pickedQty<0).length} removal transactions). ${new Set(parsed.rows.map(r=>r.sourcePerson)).size} anonymous technician code(s) will be assigned automatically.`)}
 
   async function resolveAnonymousTechnicians(){if(!supabase)throw new Error('Supabase is not configured.');const resolved:Record<string,AnonymousTechResult>={};for(const source of sourcePeople){const {data,error}=await supabase.rpc('get_or_create_anonymous_technician',{p_source_person_name:source});if(error)throw error;const row=Array.isArray(data)?data[0]:data;if(!row?.technician_id)throw new Error(`Could not assign an anonymous technician code for ${source}.`);resolved[source]=row as AnonymousTechResult}return resolved}
 
   async function importRows(){if(!supabase||!ready)return;setImporting(true);setMessage('Assigning anonymous technician codes and importing restock history…');try{
     const anonymousTechs=await resolveAnonymousTechnicians()
-    const payload=rows.filter(r=>machineMap[r.sourceMachine]!==IGNORE&&Number.isFinite(r.pickedQty)&&r.pickedQty>0&&Number.isFinite(r.packageQty)&&r.packageQty>0).map(r=>{const m=machines.find(x=>x.id===machineMap[r.sourceMachine]);const tech=anonymousTechs[r.sourcePerson];return {machine_uuid:m?.id,machine_wtn_id:m?.machine_id,technician_id:tech.technician_id,source_machine_name:r.sourceMachine,source_location_name:r.sourceLocation,source_restock_person:r.sourcePerson,selection_number:r.selection,product_name:r.product,package_quantity:r.packageQty,restock_quantity:r.pickedQty,restock_datetime:r.pickedAt,picked_from:r.pickedFrom,restock_action:r.action,source_file:filename,import_key:r.importKey}})
+    const payload=rows.filter(r=>machineMap[r.sourceMachine]!==IGNORE&&Number.isFinite(r.pickedQty)&&r.pickedQty!==0&&Number.isFinite(r.packageQty)&&r.packageQty>0).map(r=>{const m=machines.find(x=>x.id===machineMap[r.sourceMachine]);const tech=anonymousTechs[r.sourcePerson];return {machine_uuid:m?.id,machine_wtn_id:m?.machine_id,technician_id:tech.technician_id,source_machine_name:r.sourceMachine,source_location_name:r.sourceLocation,source_restock_person:r.sourcePerson,selection_number:r.selection,product_name:r.product,package_quantity:r.packageQty,restock_quantity:r.pickedQty,restock_datetime:r.pickedAt,picked_from:r.pickedFrom,restock_action:r.action,source_file:filename,import_key:r.importKey}})
     for(let i=0;i<payload.length;i+=500){const {error}=await supabase.from('restock_events').upsert(payload.slice(i,i+500),{onConflict:'import_key'});if(error)throw error}
     if(remember){const machineAliasPayload=sourceMachines.map(source=>({source_machine_name:source,machine_uuid:machineMap[source]===IGNORE?null:machineMap[source],ignored:machineMap[source]===IGNORE,updated_at:new Date().toISOString()}));const a=await supabase.from('restock_machine_aliases').upsert(machineAliasPayload,{onConflict:'source_machine_name'});if(a.error)throw a.error}
     setMessage(`Imported ${payload.length.toLocaleString()} restock rows using ${Object.keys(anonymousTechs).length} anonymous technician code(s). Ignored ${rows.length-payload.length}.`);await loadData()
