@@ -33,6 +33,9 @@ function parseRestockFile(text:string){
   lines.slice(0,headerIndex).forEach(line=>{const comma=line.indexOf(',');if(comma>0)metadata[line.slice(0,comma).trim()]=line.slice(comma+1).trim().replace(/^"|"$/g,'')})
   const hasMachineColumn=lines[headerIndex].split(',').some(h=>normalize(h)==='machinestocked')
   const rows:RestockRow[]=[];const errors:string[]=[]
+  // Keep every transaction, including repeated identical events. The first key stays
+  // compatible with previously imported data; later occurrences get stable suffixes.
+  const keyOccurrences=new Map<string,number>()
   parseCsv(lines.slice(headerIndex).join('\n')).forEach((row,i)=>{
     const sourceMachine=hasMachineColumn?value(row,'Machine Stocked'):(metadata.Machine||'').trim()
     const sourceLocation=value(row,'Location')||(metadata.Location||'').trim()
@@ -43,7 +46,11 @@ function parseRestockFile(text:string){
     if(!Number.isFinite(pickedQty)){errors.push(`Row ${headerIndex+i+2}: Picked Qty must be a valid number (negative, zero, or positive).`);return}
     if(!Number.isFinite(packageQty)||packageQty<=0){errors.push(`Row ${headerIndex+i+2}: Package Qty must be positive.`);return}
     const key=[sourceMachine,sourcePerson,rawDate,value(row,'Selection'),value(row,'Product'),pickedQty,value(row,'Restock Action')].join('|')
-    rows.push({sourceLocation,sourceMachine,selection:value(row,'Selection'),product:value(row,'Product'),packageQty,pickedQty,pickedAt,pickedFrom:value(row,'Picked From'),sourcePerson,action:value(row,'Restock Action'),importKey:hashText(key)})
+    const baseKey=hashText(key)
+    const occurrence=(keyOccurrences.get(baseKey)||0)+1
+    keyOccurrences.set(baseKey,occurrence)
+    const importKey=occurrence===1?baseKey:`${baseKey}-${occurrence}`
+    rows.push({sourceLocation,sourceMachine,selection:value(row,'Selection'),product:value(row,'Product'),packageQty,pickedQty,pickedAt,pickedFrom:value(row,'Picked From'),sourcePerson,action:value(row,'Restock Action'),importKey})
   })
   return {rows,metadata,errors}
 }
@@ -100,9 +107,12 @@ export default function Staffing(){
   async function importRows(){if(!supabase||!ready)return;setImporting(true);setMessage('Assigning anonymous technician codes and importing restock history…');try{
     const anonymousTechs=await resolveAnonymousTechnicians()
     const payload=rows.filter(r=>machineMap[r.sourceMachine]!==IGNORE&&Number.isFinite(r.pickedQty)&&Number.isFinite(r.packageQty)&&r.packageQty>0).map(r=>{const m=machines.find(x=>x.id===machineMap[r.sourceMachine]);const tech=anonymousTechs[r.sourcePerson];return {machine_uuid:m?.id,machine_wtn_id:m?.machine_id,technician_id:tech.technician_id,source_machine_name:r.sourceMachine,source_location_name:r.sourceLocation,source_restock_person:r.sourcePerson,selection_number:r.selection,product_name:r.product,package_quantity:r.packageQty,restock_quantity:r.pickedQty,restock_datetime:r.pickedAt,picked_from:r.pickedFrom,restock_action:r.action,source_file:filename,import_key:r.importKey}})
-    for(let i=0;i<payload.length;i+=500){const {error}=await supabase.from('restock_events').upsert(payload.slice(i,i+500),{onConflict:'import_key'});if(error)throw error}
+    // PostgreSQL upsert cannot update the same conflict key twice in one statement.
+    // Guard against unexpected hash collisions or repeated payload keys.
+    const uniquePayload=[...new Map(payload.map(row=>[row.import_key,row])).values()]
+    for(let i=0;i<uniquePayload.length;i+=500){const {error}=await supabase.from('restock_events').upsert(uniquePayload.slice(i,i+500),{onConflict:'import_key'});if(error)throw error}
     if(remember){const machineAliasPayload=sourceMachines.map(source=>({source_machine_name:source,machine_uuid:machineMap[source]===IGNORE?null:machineMap[source],ignored:machineMap[source]===IGNORE,updated_at:new Date().toISOString()}));const a=await supabase.from('restock_machine_aliases').upsert(machineAliasPayload,{onConflict:'source_machine_name'});if(a.error)throw a.error}
-    setMessage(`Imported ${payload.length.toLocaleString()} restock rows using ${Object.keys(anonymousTechs).length} anonymous technician code(s). Ignored ${rows.length-payload.length}.`);await loadData()
+    setMessage(`Imported ${uniquePayload.length.toLocaleString()} restock rows using ${Object.keys(anonymousTechs).length} anonymous technician code(s). Ignored ${rows.length-payload.length}.`);await loadData()
   }catch(err:any){setMessage(err?.message||'Restock import failed.')}finally{setImporting(false)}}
 
   const agencyGroups=useMemo(()=>{
